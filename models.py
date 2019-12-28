@@ -3,6 +3,8 @@ from typing import List, Optional
 import torch
 from torch import nn
 
+import utils
+
 
 class Mapping(nn.Module):
     def __init__(self,
@@ -19,13 +21,23 @@ class Mapping(nn.Module):
 
         self._heads = [nn.Linear(hidden_dim, out_dim) for _ in range(num_heads)]
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self,
+                z: torch.Tensor,
+                y: torch.Tensor) -> torch.Tensor:
+
+        assert utils.is_valid_tensor(z, num_dims=2)
+        assert utils.is_valid_tensor(y, num_dims=2, batch_size=z.shape[0])
+
+        x = z
         for layer in self._body:
             x = layer(x)
             x = nn.functional.relu(x)
 
-        outputs = [layer(x) for layer in self._heads]
-        return outputs
+        style_code = [layer(x) for layer in self._heads]
+        style_code = torch.stack(style_code, dim=1)
+        style_code = style_code[:, y]
+
+        return style_code
 
 
 class Generator(nn.Module):
@@ -60,6 +72,9 @@ class Generator(nn.Module):
                 x: torch.Tensor,
                 style_code: torch.Tensor) -> torch.Tensor:
 
+        assert utils.is_valid_image_tensor(x)
+        assert utils.is_valid_tensor(style_code, num_dims=2, batch_size=x.shape[0])
+
         for block in self._down_blocks:
             x = block(x, style_code)
 
@@ -91,11 +106,19 @@ class Discriminator(nn.Module):
 
         self._heads = [nn.Linear(1024, 1) for _ in range(num_heads)]
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self,
+                x: torch.Tensor,
+                y: torch.Tensor) -> torch.Tensor:
+
+        assert utils.is_valid_image_tensor(x)
+        assert utils.is_valid_tensor(y, num_dims=2, batch_size=x.shape[0])
+
         for block in self._down_blocks:
             x = block(x)
 
         outputs = [layer(x) for layer in self._heads]
+        outputs = torch.stack(outputs, dim=1)
+        outputs = outputs[:, y]
         return outputs
 
 
@@ -121,11 +144,20 @@ class StyleEncoder(nn.Module):
 
         self._heads = [nn.Linear(512, style_code_dim) for _ in range(num_heads)]
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self,
+                x: torch.Tensor,
+                y: torch.Tensor) -> torch.Tensor:
+
+        assert utils.is_valid_image_tensor(x)
+        assert utils.is_valid_tensor(y, num_dims=2, batch_size=x.shape[0])
+
         for block in self._down_blocks:
             x = block(x)
 
         outputs = [layer(x) for layer in self._heads]
+        outputs = torch.stack(outputs, dim=1)
+        outputs = outputs[:, y]
+
         return outputs
 
 
