@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional, Callable
 
 import torch
 from torch import nn
@@ -171,55 +171,77 @@ class ResBlock(nn.Module):
                  style_code_dim: Optional[int] = None):
         super().__init__()
 
-        # TODO: how many conv layers in each block?
-        self._conv_1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
-        self._conv_2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=1)
         # TODO: is this right?
-        self._conv_resid = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=1)
-        self._create_norm_layer(norm, out_channels, style_code_dim)
-        self._create_resample_layer(resample)
+        if in_channels == out_channels:
+            self._skip_fn = lambda x: x
+        else:
+            self._skip_fn = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=1)
 
-    def _create_norm_layer(self,
-                           norm: str,
-                           out_channels: int,
-                           style_code_dim: int) -> None:
+        # TODO: how many conv layers in each block?
+        self._norm_1 = self._create_norm_layer(norm, in_channels, style_code_dim)
+        self._conv_1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self._norm_2 = self._create_norm_layer(norm, out_channels, style_code_dim)
+        self._conv_2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=1)
+
+        self._resample = self._create_resample_layer(resample)
+
+    def forward(self, x: torch.Tensor, style_code: torch.Tensor) -> torch.Tensor:
+        # TODO: when to normalize?
+        # TODO: when to resample?
+
+        if isinstance(self._resample, nn.UpsamplingNearest2d):
+            x = self._resample(x)
+
+        x_skip = self._skip_fn(x)
+
+        # norm -> activation -> conv
+        x = self._norm_1(x, style_code)
+        x = nn.functional.relu(x)
+        x = self._conv_1(x)
+
+        # norm -> activation -> conv
+        x = self._norm_2(x, style_code)
+        x = nn.functional.relu(x)
+        x = self._conv_2(x)
+
+        x = x + x_skip
+
+        if isinstance(self._resample, nn.AvgPool2d):
+            x = self._resample(x)
+
+        return x
+
+    @staticmethod
+    def _create_norm_layer(norm: str,
+                           num_channels: int,
+                           style_code_dim: int) -> Callable:
         norm = norm.lower()
         if norm is None:
-            self._norm = lambda x: x
+            return lambda x: x
         if norm == 'in':
             # TODO: use/not learned affine transformation?
-            self._norm = nn.InstanceNorm2d(out_channels)
+            norm_layer = nn.InstanceNorm2d(num_channels)
+            return lambda x, style: norm_layer(x)
         elif norm == 'adain':
-            self._norm = AdaptiveInstanceNorm2d(out_channels, style_code_dim)
+            norm_layer = AdaptiveInstanceNorm2d(num_channels, style_code_dim)
+            return norm_layer
         else:
             raise ValueError(f'Invalid normalization method: "{norm}"')
 
-    def _create_resample_layer(self, resample: str):
+    @staticmethod
+    def _create_resample_layer(resample: str) -> Optional[Callable]:
         resample = resample.lower()
         if resample is None:
-            self._resample = lambda x: x
+            return None
         elif resample == 'avg_pool':
-            self._resample = nn.AvgPool2d(kernel_size=2)
+            return nn.AvgPool2d(kernel_size=2)
         elif resample == 'nn':
-            self._resample = nn.UpsamplingNearest2d(scale_factor=2)
-
-    def forward(self, x: torch.Tensor, style_code: torch.Tensor) -> torch.Tensor:
-        x_skip = self._conv_resid(x)
-        x = self._conv_1(x)
-        x = nn.functional.relu(x)
-        x = self._conv_2(x)
-        x = x + x_skip
-        x = nn.functional.relu(x)
-        # TODO: when to normalize?
-        x = self._norm(x, style_code)
-        # TODO: when to resample?
-        x = self._resample(x)
-        return x
+            return nn.UpsamplingNearest2d(scale_factor=2)
 
 
 class Flatten(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.view(x.size(0), -1)
+        return x.reshape(x.size(0), -1)
 
 
 class AdaptiveInstanceNorm2d(nn.Module):
@@ -227,17 +249,21 @@ class AdaptiveInstanceNorm2d(nn.Module):
                  num_channels: int,
                  style_code_dim: int):
         super(AdaptiveInstanceNorm2d, self).__init__()
+        self._num_channels = num_channels
         self._instance_norm = nn.InstanceNorm2d(num_channels)
         # TODO: single mu/sigma for all channels / unique pair for each channel?
-        self._linear = nn.Linear(style_code_dim, 2)
+        self._linear = nn.Linear(style_code_dim, num_channels * 2)
 
     def forward(self,
                 x: torch.Tensor,
                 style_code: torch.Tensor) -> torch.Tensor:
 
+        assert utils.is_valid_tensor(x, num_dims=4)
+        assert x.shape[1] == self._num_channels
+
         x = self._instance_norm(x)
         stats = self._linear(style_code)
-        mu = stats[0]
-        sigma = stats[1]
+        mu = stats[:, :self._num_channels]
+        sigma = stats[:, self._num_channels:]
         x = x * sigma.expand_as(x) + mu.expand_as(x)
         return x
