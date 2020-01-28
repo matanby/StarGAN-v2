@@ -1,1 +1,7 @@
+fire
+insightface
+numpy
+pillow
 torch
+torchvision
+tqdm
