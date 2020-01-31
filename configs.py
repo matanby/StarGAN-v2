@@ -18,6 +18,7 @@ class TrainConfig:
     lr_discriminator: float
     lr_style_encoder: float
     lr_mapping: float
+    ema_beta: float
 
     @classmethod
     def str(cls):
@@ -50,3 +51,4 @@ class FFHQ(TrainConfig):
     lr_discriminator = 1e-4
     lr_style_encoder = 1e-4
     lr_mapping = 1e-6
+    ema_beta = 0.999

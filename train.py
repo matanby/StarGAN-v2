@@ -27,12 +27,18 @@ def train(config_name: str):
         batch_size=config.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=8,  # TODO: increase.
+        num_workers=8,
     )
 
     generator = models.Generator(
         style_code_dim=config.style_code_dim,
     )
+
+    generator_ema = models.Generator(
+        style_code_dim=config.style_code_dim,
+    )
+
+    generator_ema.load_state_dict(generator.state_dict())
 
     mapping = models.Mapping(
         latent_dim=config.mapper_latent_code_dim,
@@ -75,25 +81,21 @@ def train(config_name: str):
         betas=(config.adam_beta1, config.adam_beta2)
     )
 
-    if os.path.exists('generator.pt'):
-        print('Loading Generator from PT file')
-        g_state = torch.load('generator.pt')
-        generator.load_state_dict(g_state)
-
-    if os.path.exists('mapping.pt'):
-        print('Loading Mapping network from PT file')
-        mapping_state = torch.load('mapping.pt')
-        mapping.load_state_dict(mapping_state)
-
-    if os.path.exists('style_encoder.pt'):
-        print('Loading Style Encoder from PT file')
-        encoder_state = torch.load('style_encoder.pt')
-        style_encoder.load_state_dict(encoder_state)
-
-    if os.path.exists('discriminator.pt'):
-        print('Loading Discriminator from PT file')
-        discriminator_state = torch.load('discriminator.pt')
-        discriminator.load_state_dict(discriminator_state)
+    if os.path.exists('trained_models/models.pt'):
+        print('Loading previously saved models from PT file...')
+        state = torch.load('generator.pt')
+        generator.load_state_dict(state['generator'])
+        generator_ema.load_state_dict(state['generator_ema'])
+        mapping.load_state_dict(state['mapping'])
+        style_encoder.load_state_dict(state['style_encoder'])
+        discriminator.load_state_dict(state['discriminator'])
+        opt_generator.load_state_dict(state['opt_generator'])
+        opt_mapping.load_state_dict(state['opt_mapping'])
+        opt_style_encoder.load_state_dict(state['opt_style_encoder'])
+        opt_discriminator.load_state_dict(state['opt_discriminator'])
+        curr_iter = state['curr_iter']
+    else:
+        curr_iter = 0
 
     adv_loss = losses.AdversarialLoss(discriminator)
     style_recon_loss = losses.StyleReconstructionLoss(style_encoder)
@@ -109,12 +111,14 @@ def train(config_name: str):
     style_diverse_loss.to(device)
     cycle_loss.to(device)
 
-    curr_iter = 0
-    while True:
-        if curr_iter >= config.training_iterations:
-            break
+    os.makedirs('trained_models', exist_ok=True)
+    os.makedirs('samples', exist_ok=True)
 
+    while True:
         for batch in data_loader:
+            if curr_iter >= config.training_iterations:
+                break
+
             x_real = batch['image'].to(device)
             y_real = batch['attributes']['gender'].to(device).reshape(-1, 1)
 
@@ -153,6 +157,11 @@ def train(config_name: str):
             l_d.backward()
             opt_discriminator.step()
 
+            g_params = dict(generator.named_parameters())
+            g_ema_params = dict(generator_ema.named_parameters())
+            for key in g_params:
+                g_ema_params[key].data.mul_(config.ema_beta).add_(1 - config.ema_beta, g_params[key].data)
+
             l_adv_d_np = l_adv_d.to("cpu").detach().numpy()
             l_adv_g_np = l_adv_g.to("cpu").detach().numpy()
             r1_reg_np = r1_reg.to("cpu").detach().numpy()
@@ -171,21 +180,41 @@ def train(config_name: str):
                   f'L_D: {l_d_np:.2f}, '
                   f'L_FGE: {l_fge_np:.2f}')
 
-            if (curr_iter + 1) % 100 == 0:
+            if (curr_iter + 1) % 100 == 0 or curr_iter == config.training_iterations - 1:
                 print('Saving example image...')
                 torchvision.utils.save_image(
-                    tensor=x_fake,
-                    filename='example.jpg',
+                    tensor=torch.cat(x_real, x_fake),
+                    filename=f'samples/iter_{curr_iter}.jpg',
+                    nrow=config.batch_size,
                     normalize=True,
                     range=(-1, 1)
                 )
 
-            if (curr_iter + 1) % 1000 == 0:
+                x_fake_ema = generator_ema(x_real, s)
+                torchvision.utils.save_image(
+                    tensor=torch.cat(x_real, x_fake_ema),
+                    filename=f'samples/iter_{curr_iter}_ema.jpg',
+                    nrow=config.batch_size,
+                    normalize=True,
+                    range=(-1, 1)
+                )
+
+            if (curr_iter + 1) % 1000 == 0 or curr_iter == config.training_iterations - 1:
                 print('Saving models...')
-                torch.save(generator.state_dict(), 'generator.pt')
-                torch.save(mapping.state_dict(), 'mapping.pt')
-                torch.save(style_encoder.state_dict(), 'style_encoder.pt')
-                torch.save(discriminator.state_dict(), 'discriminator.pt')
+                state = {
+                    'generator': generator.state_dict(),
+                    'generator_ema': generator_ema.state_dict(),
+                    'mapping': mapping.state_dict(),
+                    'style_encoder': style_encoder.state_dict(),
+                    'discriminator': discriminator.state_dict(),
+                    'opt_generator': opt_generator.state_dict(),
+                    'opt_mapping': opt_mapping.state_dict(),
+                    'opt_style_encoder': opt_style_encoder.state_dict(),
+                    'opt_discriminator': opt_discriminator.state_dict(),
+                    'curr_iter': curr_iter,
+                }
+
+                torch.save(state, 'trained_models/models.pt')
 
             curr_iter += 1
 
