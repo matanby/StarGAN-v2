@@ -11,15 +11,19 @@ class Mapping(nn.Module):
                  latent_dim: int,
                  hidden_dim: int,
                  out_dim: int,
-                 num_layers: int,
+                 num_shared_layers: int,
                  num_heads: int):
 
         super().__init__()
-        self._body = [nn.Linear(latent_dim, hidden_dim)]
-        for _ in range(num_layers - 1):
-            self._body.append(nn.Linear(hidden_dim, hidden_dim))
 
-        self._heads = [nn.Linear(hidden_dim, out_dim) for _ in range(num_heads)]
+        body = [nn.Linear(latent_dim, hidden_dim)]
+        for _ in range(num_shared_layers):
+            body.append(nn.Linear(hidden_dim, hidden_dim))
+
+        heads = [nn.Linear(hidden_dim, out_dim) for _ in range(num_heads)]
+
+        self._body = nn.ModuleList(body)
+        self._heads = nn.ModuleList(heads)
 
     def forward(self,
                 z: torch.Tensor,
@@ -35,7 +39,7 @@ class Mapping(nn.Module):
 
         style_code = [layer(x) for layer in self._heads]
         style_code = torch.stack(style_code, dim=1)
-        style_code = style_code[:, y]
+        style_code = torch.cat([style_code[i, y_i] for i, y_i in enumerate(y)])
 
         return style_code
 
@@ -44,7 +48,7 @@ class Generator(nn.Module):
     def __init__(self, style_code_dim: int):
         super(Generator, self).__init__()
         self._down_blocks = [
-            nn.Conv2d(3, 32, kernel_size=1, padding=1),
+            nn.Conv2d(3, 32, kernel_size=1, padding=0),
             ResBlock(32, 64, kernel_size=3, resample='avg_pool', norm='IN'),
             ResBlock(64, 128, kernel_size=3, resample='avg_pool', norm='IN'),
             ResBlock(128, 256, kernel_size=3, resample='avg_pool', norm='IN'),
@@ -63,10 +67,10 @@ class Generator(nn.Module):
             ResBlock(256, 128, kernel_size=3, resample='NN', norm='AdaIN', style_code_dim=style_code_dim),
             ResBlock(128, 64, kernel_size=3, resample='NN', norm='AdaIN', style_code_dim=style_code_dim),
             ResBlock(64, 32, kernel_size=3, resample='NN', norm='AdaIN', style_code_dim=style_code_dim),
-            nn.Conv2d(32, 3, kernel_size=1, padding=1),
+            nn.Conv2d(32, 3, kernel_size=1, padding=0),
         ]
 
-        self._all_blocks = self._down_blocks + self._inter_blocks + self._up_blocks
+        self._all_blocks = nn.ModuleList(self._down_blocks + self._inter_blocks + self._up_blocks)
 
     def forward(self,
                 x: torch.Tensor,
@@ -75,23 +79,21 @@ class Generator(nn.Module):
         assert utils.is_valid_image_tensor(x)
         assert utils.is_valid_tensor(style_code, num_dims=2, batch_size=x.shape[0])
 
-        for block in self._down_blocks:
-            x = block(x, style_code)
-
-        for block in self._inter_blocks:
-            x = block(x, style_code)
-
-        for block in self._up_blocks:
-            x = block(x, style_code)
+        for block in self._all_blocks:
+            if isinstance(block, ResBlock):
+                x = block(x, style_code)
+            else:
+                x = block(x)
 
         return x
 
 
+# noinspection DuplicatedCode
 class Discriminator(nn.Module):
     def __init__(self, num_heads: int):
         super(Discriminator, self).__init__()
-        self._down_blocks = [
-            nn.Conv2d(3, 32, kernel_size=1, padding=1),
+        down_blocks = [
+            nn.Conv2d(3, 32, kernel_size=1, padding=0),
             ResBlock(32, 64, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(64, 128, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(128, 256, kernel_size=3, resample='avg_pool', norm=None),
@@ -99,12 +101,15 @@ class Discriminator(nn.Module):
             ResBlock(512, 1024, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(1024, 1024, kernel_size=3, resample='avg_pool', norm=None),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(1024, 1024, kernel_size=4, padding=1),
+            nn.Conv2d(1024, 1024, kernel_size=4, padding=0),
             nn.LeakyReLU(0.2),
             Flatten()
         ]
 
-        self._heads = [nn.Linear(1024, 1) for _ in range(num_heads)]
+        heads = [nn.Linear(1024, 1) for _ in range(num_heads)]
+
+        self._down_blocks = nn.ModuleList(down_blocks)
+        self._heads = nn.ModuleList(heads)
 
     def forward(self,
                 x: torch.Tensor,
@@ -114,22 +119,26 @@ class Discriminator(nn.Module):
         assert utils.is_valid_tensor(y, num_dims=2, batch_size=x.shape[0])
 
         for block in self._down_blocks:
-            x = block(x)
+            if isinstance(block, ResBlock):
+                x = block(x, None)
+            else:
+                x = block(x)
 
-        outputs = [layer(x) for layer in self._heads]
-        outputs = torch.stack(outputs, dim=1)
-        outputs = outputs[:, y]
+        logits = [layer(x) for layer in self._heads]
+        outputs = torch.stack(logits, dim=1)
+        outputs = torch.cat([outputs[i, y_i] for i, y_i in enumerate(y)])
         return outputs
 
 
+# noinspection DuplicatedCode
 class StyleEncoder(nn.Module):
     def __init__(self,
                  style_code_dim: int,
                  num_heads: int):
 
         super(StyleEncoder, self).__init__()
-        self._down_blocks = [
-            nn.Conv2d(3, 16, kernel_size=1, padding=1),
+        down_blocks = [
+            nn.Conv2d(3, 16, kernel_size=1, padding=0),
             ResBlock(16, 32, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(32, 64, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(64, 128, kernel_size=3, resample='avg_pool', norm=None),
@@ -137,12 +146,15 @@ class StyleEncoder(nn.Module):
             ResBlock(256, 512, kernel_size=3, resample='avg_pool', norm=None),
             ResBlock(512, 512, kernel_size=3, resample='avg_pool', norm=None),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(512, 512, kernel_size=4, padding=1),
+            nn.Conv2d(512, 512, kernel_size=4, padding=0),
             nn.LeakyReLU(0.2),
             Flatten()
         ]
 
-        self._heads = [nn.Linear(512, style_code_dim) for _ in range(num_heads)]
+        heads = [nn.Linear(512, style_code_dim) for _ in range(num_heads)]
+
+        self._down_blocks = nn.ModuleList(down_blocks)
+        self._heads = nn.ModuleList(heads)
 
     def forward(self,
                 x: torch.Tensor,
@@ -152,11 +164,14 @@ class StyleEncoder(nn.Module):
         assert utils.is_valid_tensor(y, num_dims=2, batch_size=x.shape[0])
 
         for block in self._down_blocks:
-            x = block(x)
+            if isinstance(block, ResBlock):
+                x = block(x, None)
+            else:
+                x = block(x)
 
         outputs = [layer(x) for layer in self._heads]
         outputs = torch.stack(outputs, dim=1)
-        outputs = outputs[:, y]
+        outputs = torch.cat([outputs[i, y_i] for i, y_i in enumerate(y)])
 
         return outputs
 
@@ -171,13 +186,11 @@ class ResBlock(nn.Module):
                  style_code_dim: Optional[int] = None):
         super().__init__()
 
-        # TODO: is this right?
         if in_channels == out_channels:
             self._skip_fn = lambda x: x
         else:
-            self._skip_fn = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=1)
+            self._skip_fn = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
 
-        # TODO: how many conv layers in each block?
         self._norm_1 = self._create_norm_layer(norm, in_channels, style_code_dim)
         self._conv_1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
         self._norm_2 = self._create_norm_layer(norm, out_channels, style_code_dim)
@@ -215,9 +228,9 @@ class ResBlock(nn.Module):
     def _create_norm_layer(norm: str,
                            num_channels: int,
                            style_code_dim: int) -> Callable:
-        norm = norm.lower()
+        norm = norm.lower() if norm else None
         if norm is None:
-            return lambda x: x
+            return lambda x, style: x
         if norm == 'in':
             # TODO: use/not learned affine transformation?
             norm_layer = nn.InstanceNorm2d(num_channels)
@@ -230,7 +243,7 @@ class ResBlock(nn.Module):
 
     @staticmethod
     def _create_resample_layer(resample: str) -> Optional[Callable]:
-        resample = resample.lower()
+        resample = resample.lower() if resample else None
         if resample is None:
             return None
         elif resample == 'avg_pool':
@@ -264,6 +277,8 @@ class AdaptiveInstanceNorm2d(nn.Module):
         x = self._instance_norm(x)
         stats = self._linear(style_code)
         mu = stats[:, :self._num_channels]
+        mu.unsqueeze_(2).unsqueeze_(2)
         sigma = stats[:, self._num_channels:]
-        x = x * sigma.expand_as(x) + mu.expand_as(x)
+        sigma.unsqueeze_(2).unsqueeze_(2)
+        x = x * sigma + mu
         return x
