@@ -1,6 +1,7 @@
 fire
 numpy
 pillow
+tensorboard
 torch
 torchvision
 tqdm
