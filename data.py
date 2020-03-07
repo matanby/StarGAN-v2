@@ -9,13 +9,17 @@ import utils
 
 
 class FFHQDataset(Dataset):
-    def __init__(self, dataset_path: str):
+    def __init__(self, dataset_path: str, apply_augmentation: bool = True):
+        self._apply_augmentation = apply_augmentation
         self._prepare_paths(dataset_path)
 
     def __getitem__(self, idx: int) -> Dict:
         assert idx < len(self)
 
         image = self._load_image(idx)
+        if self._apply_augmentation:
+            image = self._augment(image)
+
         attributes = self._load_attributes(idx)
 
         item = {
@@ -55,6 +59,13 @@ class FFHQDataset(Dataset):
         image = (image * 2) - 1
         return image
 
+    @staticmethod
+    def _augment(image: np.ndarray):
+        if np.random.uniform() > 0.5:
+            # flip horizontally.
+            image = image[:, :, ::-1]
+
+        return image
 
     def _load_attributes(self, idx: int) -> Dict[str, float]:
         assert idx < len(self)
