@@ -4,6 +4,7 @@ class TrainConfig:
     adam_beta2: float
     batch_size: int
     dataset_path: str
+    ds_loss_iterations: float
     ema_beta: float
     lambda_cyc: float
     lambda_ds: float
@@ -40,6 +41,7 @@ class FFHQ(TrainConfig):
     adam_beta2 = 0.99
     batch_size = 4  # TODO: increase?
     dataset_path = '/home/ubuntu/data/ffhq-256'
+    ds_loss_iterations = 50_000
     ema_beta = 0.999
     lambda_cyc = 1.0
     lambda_ds = 1.0

@@ -30,7 +30,9 @@ class Trainer:
         device = self._device
         generator = self._generator
         mapping = self._mapping
+        mapping_ema = self._mapping_ema
         style_encoder = self._style_encoder
+        style_encoder_ema = self._style_encoder_ema
         discriminator = self._discriminator
         adv_loss = self._adv_loss
         style_recon_loss = self._style_recon_loss
@@ -70,7 +72,7 @@ class Trainer:
                 l_cyc = cycle_loss(x_real, y_real, x_fake)
 
                 l_d = l_adv_d + cfg.lambda_r1 * r1_reg
-                lambda_ds = max(0.0, cfg.lambda_ds - curr_iter * cfg.lambda_ds / cfg.training_iterations / 2)
+                lambda_ds = max(0.0, cfg.lambda_ds * (1 - curr_iter / cfg.ds_loss_iterations))
                 l_fge = (
                     l_adv_g
                     + cfg.lambda_sty * l_sty
@@ -91,7 +93,7 @@ class Trainer:
                 l_d.backward()
                 opt_discriminator.step()
 
-                self._update_generator_ema()
+                self._update_ema_models()
 
                 l_adv_d_np = l_adv_d.to("cpu").detach().numpy()
                 l_adv_g_np = l_adv_g.to("cpu").detach().numpy()
@@ -138,7 +140,10 @@ class Trainer:
                     )
 
                     with torch.no_grad():
-                        x_fake_ema = self._generator_ema(x_real, s)
+                        s_ema = mapping_ema(z, y_fake)
+                        x_fake_ema = self._generator_ema(x_real, s_ema)
+                        s_x_ema = style_encoder_ema(x_real, y_real)
+                        x_fake_recon_ema = self._generator_ema(x_real, s_x_ema)
                     sample_images_ema = torch.cat((x_real, x_fake_ema))
                     sample_save_path = os.path.join(self._samples_dir, f'iter_{curr_iter}_ema.jpg')
                     torchvision.utils.save_image(
@@ -152,9 +157,11 @@ class Trainer:
                     x_real_clamp = ((x_real + 1) / 2).clamp(0, 1)
                     x_fake_clamp = ((x_fake + 1) / 2).clamp(0, 1)
                     x_fake_ema_clamp = ((x_fake_ema + 1) / 2).clamp(0, 1)
+                    x_fake_recon_ema_clamp = ((x_fake_recon_ema + 1) / 2).clamp(0, 1)
                     self._summary_writer.add_images('samples/real', x_real_clamp, curr_iter)
                     self._summary_writer.add_images('samples/generated', x_fake_clamp, curr_iter)
                     self._summary_writer.add_images('samples/generated_ema', x_fake_ema_clamp, curr_iter)
+                    self._summary_writer.add_images('samples/recon_ema', x_fake_recon_ema_clamp, curr_iter)
 
                 if (curr_iter + 1) % cfg.model_snapshot_interval == 0 or is_last_iter:
                     prog_bar.set_description('Saving models...')
@@ -207,10 +214,27 @@ class Trainer:
             num_heads=cfg.num_domains,
         )
 
+        self._mapping_ema = models.Mapping(
+            latent_dim=cfg.mapper_latent_code_dim,
+            hidden_dim=cfg.mapper_hidden_dim,
+            out_dim=cfg.style_code_dim,
+            num_shared_layers=cfg.mapper_shared_layers,
+            num_heads=cfg.num_domains,
+        )
+
+        self._mapping_ema.load_state_dict(self._mapping.state_dict())
+
         self._style_encoder = models.StyleEncoder(
             style_code_dim=cfg.style_code_dim,
             num_heads=cfg.num_domains,
         )
+
+        self._style_encoder_ema = models.StyleEncoder(
+            style_code_dim=cfg.style_code_dim,
+            num_heads=cfg.num_domains,
+        )
+
+        self._style_encoder_ema.load_state_dict(self._style_encoder.state_dict())
 
         self._discriminator = models.Discriminator(
             num_heads=cfg.num_domains,
@@ -219,7 +243,9 @@ class Trainer:
         self._generator.to(device)
         self._generator_ema.eval().to(device)
         self._mapping.to(device)
+        self._mapping_ema.eval().to(device)
         self._style_encoder.to(device)
+        self._style_encoder_ema.eval().to(device)
         self._discriminator.to(device)
 
     def _create_losses(self) -> None:
@@ -275,7 +301,9 @@ class Trainer:
         self._generator.load_state_dict(state['generator'])
         self._generator_ema.load_state_dict(state['generator_ema'])
         self._mapping.load_state_dict(state['mapping'])
+        self._mapping_ema.load_state_dict(state['mapping_ema'])
         self._style_encoder.load_state_dict(state['style_encoder'])
+        self._style_encoder_ema.load_state_dict(state['style_encoder_ema'])
         self._discriminator.load_state_dict(state['discriminator'])
         self._opt_generator.load_state_dict(state['opt_generator'])
         self._opt_mapping.load_state_dict(state['opt_mapping'])
@@ -283,19 +311,26 @@ class Trainer:
         self._opt_discriminator.load_state_dict(state['opt_discriminator'])
         self._curr_iter = state['curr_iter']
 
-    def _update_generator_ema(self):
+    def _update_ema_model(self, model: torch.nn.Module, ema_model: torch.nn.Module) -> None:
         ema_beta = self._config.ema_beta
-        g_params = dict(self._generator.named_parameters())
-        g_ema_params = dict(self._generator_ema.named_parameters())
-        for key in g_params:
-            g_ema_params[key].data.mul_(ema_beta).add_(1 - ema_beta, g_params[key].data)
+        model_params = dict(model.named_parameters())
+        ema_model_params = dict(ema_model.named_parameters())
+        for key in model_params:
+            ema_model_params[key].data.mul_(ema_beta).add_(1 - ema_beta, model_params[key].data)
+
+    def _update_ema_models(self) -> None:
+        self._update_ema_model(self._generator, self._generator_ema)
+        self._update_ema_model(self._style_encoder, self._style_encoder_ema)
+        self._update_ema_model(self._mapping, self._mapping_ema)
 
     def _save_models(self, path: str) -> None:
         state = {
             'generator': self._generator.state_dict(),
             'generator_ema': self._generator_ema.state_dict(),
             'mapping': self._mapping.state_dict(),
+            'mapping_ema': self._mapping_ema.state_dict(),
             'style_encoder': self._style_encoder.state_dict(),
+            'style_encoder_ema': self._style_encoder_ema.state_dict(),
             'discriminator': self._discriminator.state_dict(),
             'opt_generator': self._opt_generator.state_dict(),
             'opt_mapping': self._opt_mapping.state_dict(),
